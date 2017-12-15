@@ -1,5 +1,6 @@
 # Makefile for building CoreDNS
 GITCOMMIT:=$(shell git describe --dirty --always)
+VERSION:=0.1.0
 BINARY:=coredns
 SYSTEM:=
 
@@ -7,6 +8,10 @@ all: coredns
 
 coredns: check godep
 	$(SYSTEM) go build -v -ldflags="-s -w -X github.com/coredns/coredns/coremain.gitCommit=$(GITCOMMIT)" -o $(BINARY) coremain/coredns.go
+
+release: coredns
+	@rm -rf release && mkdir release
+	tar -zcf release/coredns_$(VERSION)_linux_amd64.tgz $(BINARY)
 
 check:
 	go get -v -u github.com/alecthomas/gometalinter
@@ -20,4 +25,4 @@ clean:
 	go clean
 	rm -f coredns
 
-.PHONY: coredns check godep clean
+.PHONY: check godep clean
