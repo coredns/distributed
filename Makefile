@@ -7,7 +7,7 @@ SYSTEM:=
 all: coredns
 
 coredns: check godep
-	$(SYSTEM) go build -v -ldflags="-s -w -X github.com/coredns/coredns/coremain.gitCommit=$(GITCOMMIT)" -o $(BINARY) coremain/coredns.go
+	CGO_ENABLED=0 $(SYSTEM) go build -v -ldflags="-s -w -X github.com/coredns/coredns/coremain.gitCommit=$(GITCOMMIT)" -o $(BINARY) coremain/coredns.go
 
 release: coredns
 	@rm -rf release && mkdir release
