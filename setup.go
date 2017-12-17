@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -46,6 +47,7 @@ func (n *nsid) onStartup(d *Distributed) error {
 	var data bytes.Buffer
 	if err := n.tmpl.Execute(&data, nil); err == nil {
 		if v := data.String(); v != "" {
+			log.Printf("[INFO] NSID %q", plugin.Name(v).Normalize())
 			n.data = hex.EncodeToString([]byte(plugin.Name(v).Normalize()))
 			return nil
 		}
@@ -57,6 +59,7 @@ func (n *nsid) onStartup(d *Distributed) error {
 	data.Reset()
 	if err := n.tmpl.Execute(&data, map[string]string{"id": id}); err == nil {
 		if v := data.String(); v != "" {
+			log.Printf("[INFO] NSID %q", plugin.Name(v).Normalize())
 			n.data = hex.EncodeToString([]byte(plugin.Name(v).Normalize()))
 			return nil
 		}
@@ -180,6 +183,48 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 	var endpoints []endpoint
 
 	entries := map[string]struct{}{}
+	if strings.HasPrefix(arg, "aws:ec2:Subnet") {
+		privateIPAddress, err := ec2Metadata(ec2PrivateIPAddress)
+		if err != nil {
+			return nil, fmt.Errorf("invalid private ip: %s", err)
+		}
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			return nil, fmt.Errorf("invalid interfaces: %s", err)
+		}
+		for _, i := range interfaces {
+			addrs, err := i.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				n, ok := a.(*net.IPNet)
+				if !ok || n.IP.String() != privateIPAddress {
+					continue
+				}
+				ip, ipnet, err := net.ParseCIDR(n.String())
+				if err != nil {
+					continue
+				}
+				port := "53"
+				l := listIPAddr(ip, ipnet)
+				// remove aws subnet reserved address
+				for _, ip = range l[4 : len(l)-1] {
+					if _, ok := entries[ip.String()]; !ok {
+						entries[ip.String()] = struct{}{}
+						endpoints = append(endpoints, endpoint{
+							addr: ip.String(),
+							port: port,
+							quit: make(chan struct{}),
+						})
+					}
+				}
+				return endpoints, nil
+			}
+		}
+
+		return nil, fmt.Errorf("invalid subnet for %q", privateIPAddress)
+	}
 	if strings.HasPrefix(arg, "aws:ec2:ReservationId") {
 		reservationID, err := ec2Metadata(ec2ReservationID)
 		if err != nil {
@@ -260,7 +305,9 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 			if err != nil {
 				return nil, fmt.Errorf("invalid cidr block %q: %s", host, err)
 			}
-			for _, ip = range listIPAddr(ip, ipnet) {
+			l := listIPAddr(ip, ipnet)
+			// remove network address and broadcast address
+			for _, ip = range l[1 : len(l)-1] {
 				if _, ok := entries[ip.String()]; !ok {
 					entries[ip.String()] = struct{}{}
 					endpoints = append(endpoints, endpoint{
@@ -305,12 +352,12 @@ func listIPAddr(ip net.IP, ipnet *net.IPNet) []net.IP {
 		copy(entry, ip)
 		entries = append(entries, entry)
 	}
-	// remove network address and broadcast address
-	return entries[1 : len(entries)-1]
+	return entries
 }
 
 const (
 	ec2AmiLaunchIndex   = "http://169.254.169.254/latest/meta-data/ami-launch-index"
 	ec2ReservationID    = "http://169.254.169.254/latest/meta-data/reservation-id"
 	ec2AvailabilityZone = "http://169.254.169.254/latest/meta-data/placement/availability-zone"
+	ec2PrivateIPAddress = "http://169.254.169.254/latest/meta-data/local-ipv4"
 )

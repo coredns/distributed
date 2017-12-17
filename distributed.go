@@ -146,6 +146,7 @@ func (e *endpoint) OnShutdown(d *Distributed) error {
 
 // OnStartup is the startup handle
 func (e *endpoint) OnStartup(d *Distributed) error {
+	log.Printf("[INFO] Endpoint %q started", e.addr)
 	go func() {
 		// Update record at the startup time
 		e.update(d)
@@ -159,6 +160,7 @@ func (e *endpoint) OnStartup(d *Distributed) error {
 					continue
 				}
 			case <-e.quit:
+				log.Printf("[INFO] Endpoint %q finished", e.addr)
 				return
 			}
 		}
