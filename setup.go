@@ -16,6 +16,11 @@ import (
 	"github.com/coredns/coredns/plugin"
 
 	"github.com/mholt/caddy"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
 func init() {
@@ -45,7 +50,7 @@ func (n *nsid) onStartup(d *Distributed) error {
 			return nil
 		}
 	}
-	id, err := amiLaunchIndex()
+	id, err := ec2Metadata(ec2AmiLaunchIndex)
 	if err != nil {
 		return err
 	}
@@ -64,8 +69,8 @@ func (n *nsid) value(d *Distributed) string {
 	return n.data
 }
 
-func amiLaunchIndex() (string, error) {
-	resp, err := http.Get(ec2AmiLaunchIndex)
+func ec2Metadata(query string) (string, error) {
+	resp, err := http.Get(query)
 	if err != nil {
 		return "", err
 	}
@@ -134,10 +139,23 @@ func distributedParse(c *caddy.Controller) (string, []endpoint, *template.Templa
 		if len(args) != 3 {
 			return "", nil, nil, c.Dispenser.ArgErr()
 		}
+		var credential *credentials.Credentials
+		for c.NextBlock() {
+			switch c.Val() {
+			case "aws_access_key":
+				v := c.RemainingArgs()
+				if len(v) < 2 {
+					return "", nil, nil, c.Errf("invalid access key '%v'", v)
+				}
+				credential = credentials.NewStaticCredentials(v[0], v[1], "")
+			default:
+				return "", nil, nil, c.Errf("unknown property '%s'", c.Val())
+			}
+		}
 
 		origin := plugin.Host(args[0]).Normalize()
 
-		endpoints, err := parseEndpoint(args[1])
+		endpoints, err := parseEndpoint(args[1], credential)
 		if err != nil {
 			return "", nil, nil, err
 		}
@@ -157,10 +175,59 @@ func distributedParse(c *caddy.Controller) (string, []endpoint, *template.Templa
 	return "", nil, nil, c.Dispenser.ArgErr()
 }
 
-func parseEndpoint(arg string) ([]endpoint, error) {
+func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint, error) {
 	var endpoints []endpoint
 
 	entries := map[string]struct{}{}
+	if strings.HasPrefix(arg, "aws:ec2:ReservationId") {
+		reservationID, err := ec2Metadata(ec2ReservationID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid reservation id: %s", err)
+		}
+
+		az, err := ec2Metadata(ec2AvailabilityZone)
+		if err != nil {
+			return nil, fmt.Errorf("invalide availability zone: %s", err)
+		}
+		if len(az) <= 1 {
+			return nil, fmt.Errorf("invalide availability zone %q", az)
+		}
+		region := az[:len(az)-1]
+
+		service := ec2.New(session.Must(session.NewSession(&aws.Config{
+			Region:      aws.String(region),
+			Credentials: credential,
+		})))
+
+		result, err := service.DescribeInstances(&ec2.DescribeInstancesInput{
+			Filters: []*ec2.Filter{
+				{
+					Name: aws.String("reservation-id"),
+					Values: []*string{
+						aws.String(reservationID),
+					},
+				},
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		port := "53"
+		for _, reservation := range result.Reservations {
+			for _, instance := range reservation.Instances {
+				if instance.PrivateIpAddress != nil {
+					endpoints = append(endpoints, endpoint{
+						addr: aws.StringValue(instance.PrivateIpAddress),
+						port: port,
+						quit: make(chan struct{}),
+					})
+				}
+			}
+		}
+
+		return endpoints, nil
+	}
 	for _, s := range strings.Split(arg, ",") {
 		s = strings.TrimSpace(s)
 		if s == "" {
@@ -242,5 +309,7 @@ func listIPAddr(ip net.IP, ipnet *net.IPNet) []net.IP {
 }
 
 const (
-	ec2AmiLaunchIndex = "http://169.254.169.254/latest/meta-data/ami-launch-index"
+	ec2AmiLaunchIndex   = "http://169.254.169.254/latest/meta-data/ami-launch-index"
+	ec2ReservationID    = "http://169.254.169.254/latest/meta-data/reservation-id"
+	ec2AvailabilityZone = "http://169.254.169.254/latest/meta-data/placement/availability-zone"
 )
