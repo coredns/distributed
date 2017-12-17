@@ -54,6 +54,7 @@ func (n *nsid) onStartup(d *Distributed) error {
 	if err != nil {
 		return err
 	}
+	data.Reset()
 	if err := n.tmpl.Execute(&data, map[string]string{"id": id}); err == nil {
 		if v := data.String(); v != "" {
 			n.data = hex.EncodeToString([]byte(plugin.Name(v).Normalize()))
