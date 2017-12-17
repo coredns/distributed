@@ -1,10 +1,16 @@
 package distributed
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"text/template"
 
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
@@ -19,10 +25,73 @@ func init() {
 	})
 }
 
+type nsid struct {
+	sync.RWMutex
+	data string
+	tmpl *template.Template
+	quit chan struct{}
+}
+
+func (n *nsid) onShutdown(d *Distributed) error {
+	close(n.quit)
+	return nil
+}
+
+func (n *nsid) onStartup(d *Distributed) error {
+	var data bytes.Buffer
+	if err := n.tmpl.Execute(&data, nil); err == nil {
+		if v := data.String(); v != "" {
+			n.data = hex.EncodeToString([]byte(plugin.Name(v).Normalize()))
+			return nil
+		}
+	}
+	id, err := amiLaunchIndex()
+	if err != nil {
+		return err
+	}
+	if err := n.tmpl.Execute(&data, map[string]string{"id": id}); err == nil {
+		if v := data.String(); v != "" {
+			n.data = hex.EncodeToString([]byte(plugin.Name(v).Normalize()))
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid id information")
+}
+
+func (n *nsid) value(d *Distributed) string {
+	n.RLock()
+	defer n.RUnlock()
+	return n.data
+}
+
+func amiLaunchIndex() (string, error) {
+	resp, err := http.Get(ec2AmiLaunchIndex)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("invalid status code: %s (%d)", resp.Status, resp.StatusCode)
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if len(body) == 0 {
+		return "", fmt.Errorf("invalid response %q", string(body))
+	}
+	return string(body), nil
+}
+
 func setup(c *caddy.Controller) error {
-	origin, endpoints, nsid, err := distributedParse(c)
+	origin, endpoints, tmpl, err := distributedParse(c)
 	if err != nil {
 		return plugin.Error("distributed", err)
+	}
+
+	n := nsid{
+		tmpl: tmpl,
+		quit: make(chan struct{}),
 	}
 
 	d := &Distributed{
@@ -35,7 +104,7 @@ func setup(c *caddy.Controller) error {
 		d.Next = next
 		d.Origin = origin
 		d.Endpoints = &endpoints
-		d.Nsid = nsid
+		d.Identity = &n
 		return d
 	})
 
@@ -49,32 +118,43 @@ func setup(c *caddy.Controller) error {
 		})
 	}
 
+	c.OnStartup(func() error {
+		return n.onStartup(d)
+	})
+	c.OnShutdown(func() error {
+		return n.onShutdown(d)
+	})
+
 	return nil
 }
 
-func distributedParse(c *caddy.Controller) (string, []endpoint, string, error) {
+func distributedParse(c *caddy.Controller) (string, []endpoint, *template.Template, error) {
 	for c.Next() {
 		args := c.RemainingArgs()
 		if len(args) != 3 {
-			return "", nil, "", c.Dispenser.ArgErr()
+			return "", nil, nil, c.Dispenser.ArgErr()
 		}
 
 		origin := plugin.Host(args[0]).Normalize()
 
 		endpoints, err := parseEndpoint(args[1])
 		if err != nil {
-			return "", nil, "", err
+			return "", nil, nil, err
 		}
 
-		nsid := args[2]
+		tmpl := template.Must(template.New("nsid").Option("missingkey=error").Parse(args[2]))
 
-		if origin == "" || len(endpoints) == 0 || nsid == "" {
-			return "", nil, "", c.Dispenser.ArgErr()
+		if origin == "" || len(endpoints) == 0 || tmpl == nil {
+			return "", nil, nil, c.Dispenser.ArgErr()
 		}
 
-		return origin, endpoints, nsid, nil
+		if err := tmpl.Execute(ioutil.Discard, map[string]int{"id": 0}); err != nil {
+			return "", nil, nil, err
+		}
+
+		return origin, endpoints, tmpl, nil
 	}
-	return "", nil, "", c.Dispenser.ArgErr()
+	return "", nil, nil, c.Dispenser.ArgErr()
 }
 
 func parseEndpoint(arg string) ([]endpoint, error) {
@@ -160,3 +240,7 @@ func listIPAddr(ip net.IP, ipnet *net.IPNet) []net.IP {
 	// remove network address and broadcast address
 	return entries[1 : len(entries)-1]
 }
+
+const (
+	ec2AmiLaunchIndex = "http://169.254.169.254/latest/meta-data/ami-launch-index"
+)

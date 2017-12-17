@@ -17,6 +17,12 @@ import (
 	"golang.org/x/net/context"
 )
 
+type identity interface {
+	onShutdown(d *Distributed) error
+	onStartup(d *Distributed) error
+	value(d *Distributed) string
+}
+
 type endpoint struct {
 	addr string
 	port string
@@ -33,9 +39,9 @@ type entries struct {
 type Distributed struct {
 	Next      plugin.Handler
 	Origin    string
+	Identity  identity
 	Endpoints *[]endpoint
 	Entries   *entries
-	Nsid      string
 }
 
 func (e *endpoint) update(d *Distributed) error {
@@ -193,11 +199,13 @@ func (d Distributed) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.
 		srv.Target = "."
 
 		answers = append(answers, srv)
-		if option := r.IsEdns0(); option != nil {
-			for _, o := range option.Option {
-				if e, ok := o.(*dns.EDNS0_NSID); ok {
-					e.Code = dns.EDNS0NSID
-					e.Nsid = hex.EncodeToString([]byte(plugin.Name(d.Nsid).Normalize()))
+		if nsid := d.Identity.value(&d); nsid != "" {
+			if option := r.IsEdns0(); option != nil {
+				for _, o := range option.Option {
+					if e, ok := o.(*dns.EDNS0_NSID); ok {
+						e.Code = dns.EDNS0NSID
+						e.Nsid = nsid
+					}
 				}
 			}
 		}
