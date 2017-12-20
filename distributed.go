@@ -18,12 +18,11 @@ import (
 )
 
 type identity interface {
-	onShutdown(d *Distributed) error
-	onStartup(d *Distributed) error
 	value(d *Distributed) string
 }
 
 type endpoint struct {
+	sync.RWMutex
 	addr string
 	port string
 	quit chan struct{}
@@ -42,27 +41,30 @@ type Distributed struct {
 	Identity  identity
 	Endpoints *[]endpoint
 	Entries   *entries
+	quit      chan struct{}
 }
 
 func (e *endpoint) update(d *Distributed) error {
-	name, _ := e.query(d)
-
+	name, addr, _ := e.query(d)
+	if name == "" && addr == "" {
+		return nil
+	}
 	d.Entries.Lock()
 	defer d.Entries.Unlock()
 
 	// Only update when data is dirty
 	dirty := false
 	if name == "" {
-		if v, ok := d.Entries.byAddr[e.addr]; ok {
-			delete(d.Entries.byAddr, e.addr)
+		if v, ok := d.Entries.byAddr[addr]; ok {
+			delete(d.Entries.byAddr, addr)
 			dirty = true
-			log.Printf("[INFO] Record %q:%q has been removed from the lookup table", e.addr, v)
+			log.Printf("[INFO] Record %q:%q has been removed from the lookup table", addr, v)
 		}
 	} else {
-		if v, ok := d.Entries.byAddr[e.addr]; !ok || v != name {
-			d.Entries.byAddr[e.addr] = name
+		if v, ok := d.Entries.byAddr[addr]; !ok || v != name {
+			d.Entries.byAddr[addr] = name
 			dirty = true
-			log.Printf("[INFO] Record %q:%q has been inserted to the lookup table", e.addr, name)
+			log.Printf("[INFO] Record %q:%q has been inserted to the lookup table", addr, name)
 		}
 	}
 
@@ -75,11 +77,17 @@ func (e *endpoint) update(d *Distributed) error {
 	return nil
 }
 
-func (e *endpoint) query(d *Distributed) (string, error) {
+func (e *endpoint) query(d *Distributed) (string, string, error) {
+	e.RLock()
+	defer e.RUnlock()
+	if e.addr == "" {
+		return "", "", nil
+	}
+
 	addr := net.JoinHostPort(e.addr, e.port)
 	conn, err := net.DialTimeout("udp", addr, defaultTimeout)
 	if err != nil {
-		return "", err
+		return "", e.addr, err
 	}
 
 	req := dns.Msg{}
@@ -106,22 +114,22 @@ func (e *endpoint) query(d *Distributed) (string, error) {
 	conn.Close()
 
 	if res == nil {
-		return "", err
+		return "", e.addr, err
 	}
 
 	option = res.IsEdns0()
 	for _, s := range option.Option {
-		switch e := s.(type) {
+		switch v := s.(type) {
 		case *dns.EDNS0_NSID:
-			nsid, err := hex.DecodeString(e.Nsid)
+			nsid, err := hex.DecodeString(v.Nsid)
 			if err != nil {
-				return "", err
+				return "", e.addr, err
 			}
-			return string(nsid), nil
+			return string(nsid), e.addr, nil
 		}
 	}
 
-	return "", fmt.Errorf("no nsid returned for %q", addr)
+	return "", e.addr, fmt.Errorf("no nsid returned for %q", addr)
 }
 
 func (d Distributed) lookup(ctx context.Context, qname string) []net.IP {
@@ -139,28 +147,46 @@ func (d Distributed) lookup(ctx context.Context, qname string) []net.IP {
 }
 
 // OnShutdown is the shutdown handle
-func (e *endpoint) OnShutdown(d *Distributed) error {
-	close(e.quit)
+func (d *Distributed) OnShutdown() error {
+	for i := range *d.Endpoints {
+		close((*d.Endpoints)[i].quit)
+	}
+	close(d.quit)
 	return nil
 }
 
 // OnStartup is the startup handle
-func (e *endpoint) OnStartup(d *Distributed) error {
-	log.Printf("[INFO] Endpoint %q started", e.addr)
+func (d *Distributed) OnStartup() error {
+	d.quit = make(chan struct{})
+	for i := range *d.Endpoints {
+		go func(e *endpoint) {
+			log.Printf("[INFO] Endpoint started")
+			// Update record at the startup time
+			e.update(d)
+
+			tick := time.NewTicker(defaultInterval)
+
+			for {
+				select {
+				case <-tick.C:
+					if err := e.update(d); err != nil {
+						continue
+					}
+				case <-e.quit:
+					log.Printf("[INFO] Endpoint finished")
+					return
+				}
+			}
+		}(&(*d.Endpoints)[i])
+	}
+
 	go func() {
-		// Update record at the startup time
-		e.update(d)
-
 		tick := time.NewTicker(defaultInterval)
-
 		for {
 			select {
 			case <-tick.C:
-				if err := e.update(d); err != nil {
-					continue
-				}
-			case <-e.quit:
-				log.Printf("[INFO] Endpoint %q finished", e.addr)
+				// do something
+			case <-d.quit:
 				return
 			}
 		}

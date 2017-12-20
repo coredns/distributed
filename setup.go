@@ -8,9 +8,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"text/template"
 
 	"github.com/coredns/coredns/core/dnsserver"
@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
@@ -31,46 +32,10 @@ func init() {
 	})
 }
 
-type nsid struct {
-	sync.RWMutex
-	data string
-	tmpl *template.Template
-	quit chan struct{}
-}
+type nsid string
 
-func (n *nsid) onShutdown(d *Distributed) error {
-	close(n.quit)
-	return nil
-}
-
-func (n *nsid) onStartup(d *Distributed) error {
-	var data bytes.Buffer
-	if err := n.tmpl.Execute(&data, nil); err == nil {
-		if v := data.String(); v != "" {
-			log.Printf("[INFO] NSID %q", plugin.Name(v).Normalize())
-			n.data = hex.EncodeToString([]byte(plugin.Name(v).Normalize()))
-			return nil
-		}
-	}
-	id, err := ec2Metadata(ec2AmiLaunchIndex)
-	if err != nil {
-		return err
-	}
-	data.Reset()
-	if err := n.tmpl.Execute(&data, map[string]string{"id": id}); err == nil {
-		if v := data.String(); v != "" {
-			log.Printf("[INFO] NSID %q", plugin.Name(v).Normalize())
-			n.data = hex.EncodeToString([]byte(plugin.Name(v).Normalize()))
-			return nil
-		}
-	}
-	return fmt.Errorf("invalid id information")
-}
-
-func (n *nsid) value(d *Distributed) string {
-	n.RLock()
-	defer n.RUnlock()
-	return n.data
+func (n nsid) value(d *Distributed) string {
+	return hex.EncodeToString([]byte(n))
 }
 
 func ec2Metadata(query string) (string, error) {
@@ -93,14 +58,9 @@ func ec2Metadata(query string) (string, error) {
 }
 
 func setup(c *caddy.Controller) error {
-	origin, endpoints, tmpl, err := distributedParse(c)
+	origin, endpoints, identity, err := distributedParse(c)
 	if err != nil {
 		return plugin.Error("distributed", err)
-	}
-
-	n := nsid{
-		tmpl: tmpl,
-		quit: make(chan struct{}),
 	}
 
 	d := &Distributed{
@@ -108,40 +68,30 @@ func setup(c *caddy.Controller) error {
 			byName: map[string][]net.IP{},
 			byAddr: map[string]string{},
 		},
+		Endpoints: &endpoints,
 	}
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
 		d.Next = next
 		d.Origin = origin
-		d.Endpoints = &endpoints
-		d.Identity = &n
+		d.Identity = nsid(identity)
 		return d
 	})
 
-	for i := range endpoints {
-		u := endpoints[i]
-		c.OnStartup(func() error {
-			return u.OnStartup(d)
-		})
-		c.OnShutdown(func() error {
-			return u.OnShutdown(d)
-		})
-	}
-
 	c.OnStartup(func() error {
-		return n.onStartup(d)
+		return d.OnStartup()
 	})
 	c.OnShutdown(func() error {
-		return n.onShutdown(d)
+		return d.OnShutdown()
 	})
-
+	log.Printf("[INFO] NSID: %q", identity)
 	return nil
 }
 
-func distributedParse(c *caddy.Controller) (string, []endpoint, *template.Template, error) {
+func distributedParse(c *caddy.Controller) (string, []endpoint, string, error) {
 	for c.Next() {
 		args := c.RemainingArgs()
 		if len(args) != 3 {
-			return "", nil, nil, c.Dispenser.ArgErr()
+			return "", nil, "", c.Dispenser.ArgErr()
 		}
 		var credential *credentials.Credentials
 		for c.NextBlock() {
@@ -149,48 +99,51 @@ func distributedParse(c *caddy.Controller) (string, []endpoint, *template.Templa
 			case "aws_access_key":
 				v := c.RemainingArgs()
 				if len(v) < 2 {
-					return "", nil, nil, c.Errf("invalid access key '%v'", v)
+					return "", nil, "", c.Errf("invalid access key '%v'", v)
 				}
 				credential = credentials.NewStaticCredentials(v[0], v[1], "")
 			default:
-				return "", nil, nil, c.Errf("unknown property '%s'", c.Val())
+				return "", nil, "", c.Errf("unknown property '%s'", c.Val())
 			}
 		}
 
 		origin := plugin.Host(args[0]).Normalize()
 
-		endpoints, err := parseEndpoint(args[1], credential)
+		endpoints, index, err := parseEndpointAndIndex(args[1], credential)
 		if err != nil {
-			return "", nil, nil, err
+			return "", nil, "", err
 		}
 
 		tmpl := template.Must(template.New("nsid").Option("missingkey=error").Parse(args[2]))
 
 		if origin == "" || len(endpoints) == 0 || tmpl == nil {
-			return "", nil, nil, c.Dispenser.ArgErr()
+			return "", nil, "", c.Dispenser.ArgErr()
 		}
 
-		if err := tmpl.Execute(ioutil.Discard, map[string]int{"id": 0}); err != nil {
-			return "", nil, nil, err
+		var data bytes.Buffer
+		if err := tmpl.Execute(&data, map[string]string{"id": index}); err != nil {
+			return "", nil, "", err
 		}
 
-		return origin, endpoints, tmpl, nil
+		nsid := plugin.Name(data.String()).Normalize()
+
+		return origin, endpoints, nsid, nil
 	}
-	return "", nil, nil, c.Dispenser.ArgErr()
+	return "", nil, "", c.Dispenser.ArgErr()
 }
 
-func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint, error) {
+func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]endpoint, string, error) {
 	var endpoints []endpoint
 
 	entries := map[string]struct{}{}
 	if strings.HasPrefix(arg, "aws:ec2:Subnet") {
 		privateIPAddress, err := ec2Metadata(ec2PrivateIPAddress)
 		if err != nil {
-			return nil, fmt.Errorf("invalid private ip: %s", err)
+			return nil, "", fmt.Errorf("invalid private ip: %s", err)
 		}
 		interfaces, err := net.Interfaces()
 		if err != nil {
-			return nil, fmt.Errorf("invalid interfaces: %s", err)
+			return nil, "", fmt.Errorf("invalid interfaces: %s", err)
 		}
 		for _, i := range interfaces {
 			addrs, err := i.Addrs()
@@ -219,24 +172,114 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 						})
 					}
 				}
-				return endpoints, nil
+				id, err := ec2Metadata(ec2AmiLaunchIndex)
+				if err != nil {
+					return nil, "", fmt.Errorf("invalid launch index: %s", err)
+				}
+				return endpoints, id, nil
 			}
 		}
 
-		return nil, fmt.Errorf("invalid subnet for %q", privateIPAddress)
+		return nil, "", fmt.Errorf("invalid subnet for %q", privateIPAddress)
 	}
-	if strings.HasPrefix(arg, "aws:ec2:ReservationId") {
-		reservationID, err := ec2Metadata(ec2ReservationID)
+	if strings.HasPrefix(arg, "aws:autoscaling") {
+		instanceID, err := ec2Metadata(ec2InstanceID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid reservation id: %s", err)
+			return nil, "", fmt.Errorf("invalid instance id: %s", err)
 		}
 
 		az, err := ec2Metadata(ec2AvailabilityZone)
 		if err != nil {
-			return nil, fmt.Errorf("invalide availability zone: %s", err)
+			return nil, "", fmt.Errorf("invalide availability zone: %s", err)
 		}
 		if len(az) <= 1 {
-			return nil, fmt.Errorf("invalide availability zone %q", az)
+			return nil, "", fmt.Errorf("invalide availability zone %q", az)
+		}
+		region := az[:len(az)-1]
+
+		service := autoscaling.New(session.Must(session.NewSession(&aws.Config{
+			Region:      aws.String(region),
+			Credentials: credential,
+		})))
+		groups, err := service.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{})
+		if err != nil {
+			return nil, "", err
+		}
+		name := ""
+		capacity := 0
+		for _, group := range groups.AutoScalingGroups {
+			for _, instance := range group.Instances {
+				if aws.StringValue(instance.InstanceId) == instanceID {
+					name = aws.StringValue(group.AutoScalingGroupName)
+					capacity = int(aws.Int64Value(group.DesiredCapacity))
+					break
+				}
+			}
+			if name != "" {
+				break
+			}
+		}
+		if name == "" {
+			return nil, "", fmt.Errorf("invalid instance id for autoscaling group %q", instanceID)
+		}
+		result, err := service.DescribeScalingActivities(&autoscaling.DescribeScalingActivitiesInput{
+			AutoScalingGroupName: aws.String(name),
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		l := listInstances(result.Activities, capacity)
+		id, ok := l[instanceID]
+		if !ok {
+			return nil, "", fmt.Errorf("unable to allocate a slot for autoscaling for %q", instanceID)
+		}
+
+		for i := 0; i < capacity; i++ {
+			endpoints = append(endpoints, endpoint{
+				addr: "",
+				port: "",
+				quit: make(chan struct{}),
+			})
+		}
+		ec2service := ec2.New(session.Must(session.NewSession(&aws.Config{
+			Region:      aws.String(region),
+			Credentials: credential,
+		})))
+
+		port := "53"
+		for v, i := range l {
+			result, err := ec2service.DescribeInstances(&ec2.DescribeInstancesInput{
+				Filters: []*ec2.Filter{
+					{
+						Name: aws.String("instance-id"),
+						Values: []*string{
+							aws.String(v),
+						},
+					},
+				},
+			})
+			if err != nil {
+				return nil, "", err
+			}
+			if len(result.Reservations) == 1 && len(result.Reservations[0].Instances) == 1 {
+				endpoints[i].addr = aws.StringValue(result.Reservations[0].Instances[0].PrivateIpAddress)
+				endpoints[i].port = port
+			}
+		}
+		return endpoints, fmt.Sprintf("%d", id), nil
+	}
+	if strings.HasPrefix(arg, "aws:ec2:ReservationId") {
+		reservationID, err := ec2Metadata(ec2ReservationID)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid reservation id: %s", err)
+		}
+
+		az, err := ec2Metadata(ec2AvailabilityZone)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalide availability zone: %s", err)
+		}
+		if len(az) <= 1 {
+			return nil, "", fmt.Errorf("invalide availability zone %q", az)
 		}
 		region := az[:len(az)-1]
 
@@ -256,7 +299,7 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 			},
 		})
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 		port := "53"
@@ -272,7 +315,11 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 			}
 		}
 
-		return endpoints, nil
+		id, err := ec2Metadata(ec2AmiLaunchIndex)
+		if err != nil {
+			return nil, "", fmt.Errorf("invalid launch index: %s", err)
+		}
+		return endpoints, id, nil
 	}
 	for _, s := range strings.Split(arg, ",") {
 		s = strings.TrimSpace(s)
@@ -284,12 +331,12 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 		port := "53"
 		colon := strings.LastIndex(s, ":")
 		if colon == len(s)-1 {
-			return nil, fmt.Errorf("expecting data after last colon: %q", s)
+			return nil, "", fmt.Errorf("expecting data after last colon: %q", s)
 		}
 		if colon != -1 {
 			if p, err := strconv.Atoi(s[colon+1:]); err == nil {
 				if p < 0 || p >= 65536 {
-					return nil, fmt.Errorf("invalid port number: %q", s[colon+1:])
+					return nil, "", fmt.Errorf("invalid port number: %q", s[colon+1:])
 				}
 				port = strconv.Itoa(p)
 				host = s[:colon]
@@ -298,12 +345,12 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 
 		slash := strings.LastIndex(host, "/")
 		if slash == len(host)-1 {
-			return nil, fmt.Errorf("expecting data after last slash: %q", host)
+			return nil, "", fmt.Errorf("expecting data after last slash: %q", host)
 		}
 		if slash != -1 {
 			ip, ipnet, err := net.ParseCIDR(host)
 			if err != nil {
-				return nil, fmt.Errorf("invalid cidr block %q: %s", host, err)
+				return nil, "", fmt.Errorf("invalid cidr block %q: %s", host, err)
 			}
 			l := listIPAddr(ip, ipnet)
 			// remove network address and broadcast address
@@ -322,7 +369,7 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 		}
 		ip := net.ParseIP(host)
 		if ip == nil {
-			return nil, fmt.Errorf("invalid ip address: %q", host)
+			return nil, "", fmt.Errorf("invalid ip address: %q", host)
 		}
 		if _, ok := entries[ip.String()]; !ok {
 			entries[ip.String()] = struct{}{}
@@ -333,7 +380,69 @@ func parseEndpoint(arg string, credential *credentials.Credentials) ([]endpoint,
 			})
 		}
 	}
-	return endpoints, nil
+	id, err := ec2Metadata(ec2AmiLaunchIndex)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid launch index: %s", err)
+	}
+	return endpoints, id, nil
+}
+
+type byActivity []*autoscaling.Activity
+
+func (s byActivity) Len() int {
+	return len(s)
+}
+func (s byActivity) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+func (s byActivity) Less(i, j int) bool {
+	return s[i].EndTime.Before(*s[j].EndTime) || s[i].StartTime.Before(*s[j].StartTime) || aws.StringValue(s[i].ActivityId) < aws.StringValue(s[j].ActivityId)
+}
+
+func listInstances(activities []*autoscaling.Activity, capacity int) map[string]int {
+	entries := activities[:0]
+	for _, entry := range activities {
+		if strings.HasPrefix(aws.StringValue(entry.Description), "Launching a new EC2 instance: ") || strings.HasPrefix(aws.StringValue(entry.Description), "Terminating EC2 instance: ") || aws.StringValue(entry.StatusCode) == "Successful" {
+			entries = append(entries, entry)
+		}
+	}
+	sort.Sort(byActivity(entries))
+	slot := map[int]string{}
+	for _, entry := range entries {
+		if strings.HasPrefix(aws.StringValue(entry.Description), "Launching a new EC2 instance: ") {
+			instanceID := aws.StringValue(entry.Description)[30:]
+			id := -1
+			for i := 0; i < capacity; i++ {
+				if _, ok := slot[i]; !ok {
+					id = i
+					break
+				}
+			}
+			if id < 0 {
+				panic(fmt.Errorf("no open slot %s", instanceID))
+			}
+			slot[id] = instanceID
+		} else if strings.HasPrefix(aws.StringValue(entry.Description), "Terminating EC2 instance: ") {
+			instanceID := aws.StringValue(entry.Description)[26:]
+			id := -1
+			for i := 0; i < capacity; i++ {
+				if v, ok := slot[i]; ok {
+					if v == instanceID {
+						id = i
+					}
+				}
+			}
+			if id < 0 {
+				panic(fmt.Errorf("unknown id %s", instanceID))
+			}
+			delete(slot, id)
+		}
+	}
+	instances := map[string]int{}
+	for k, v := range slot {
+		instances[v] = k
+	}
+	return instances
 }
 
 func listIPAddr(ip net.IP, ipnet *net.IPNet) []net.IP {
@@ -358,6 +467,7 @@ func listIPAddr(ip net.IP, ipnet *net.IPNet) []net.IP {
 const (
 	ec2AmiLaunchIndex   = "http://169.254.169.254/latest/meta-data/ami-launch-index"
 	ec2ReservationID    = "http://169.254.169.254/latest/meta-data/reservation-id"
+	ec2InstanceID       = "http://169.254.169.254/latest/meta-data/instance-id"
 	ec2AvailabilityZone = "http://169.254.169.254/latest/meta-data/placement/availability-zone"
 	ec2PrivateIPAddress = "http://169.254.169.254/latest/meta-data/local-ipv4"
 )
