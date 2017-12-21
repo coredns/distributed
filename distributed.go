@@ -160,7 +160,6 @@ func (d *Distributed) OnStartup() error {
 	d.quit = make(chan struct{})
 	for i := range *d.Endpoints {
 		go func(e *endpoint) {
-			log.Printf("[INFO] Endpoint started")
 			// Update record at the startup time
 			e.update(d)
 
@@ -173,7 +172,6 @@ func (d *Distributed) OnStartup() error {
 						continue
 					}
 				case <-e.quit:
-					log.Printf("[INFO] Endpoint finished")
 					return
 				}
 			}
