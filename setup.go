@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -58,22 +57,13 @@ func ec2Metadata(query string) (string, error) {
 }
 
 func setup(c *caddy.Controller) error {
-	origin, endpoints, identity, err := distributedParse(c)
+	d, err := distributedParse(c)
 	if err != nil {
 		return plugin.Error("distributed", err)
 	}
 
-	d := &Distributed{
-		Entries: &entries{
-			byName: map[string][]net.IP{},
-			byAddr: map[string]string{},
-		},
-		Endpoints: &endpoints,
-	}
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
 		d.Next = next
-		d.Origin = origin
-		d.Identity = nsid(identity)
 		return d
 	})
 
@@ -83,15 +73,15 @@ func setup(c *caddy.Controller) error {
 	c.OnShutdown(func() error {
 		return d.OnShutdown()
 	})
-	log.Printf("[INFO] NSID: %q", identity)
+
 	return nil
 }
 
-func distributedParse(c *caddy.Controller) (string, []endpoint, string, error) {
+func distributedParse(c *caddy.Controller) (*Distributed, error) {
 	for c.Next() {
 		args := c.RemainingArgs()
 		if len(args) != 3 {
-			return "", nil, "", c.Dispenser.ArgErr()
+			return nil, c.Dispenser.ArgErr()
 		}
 		var credential *credentials.Credentials
 		for c.NextBlock() {
@@ -99,11 +89,11 @@ func distributedParse(c *caddy.Controller) (string, []endpoint, string, error) {
 			case "aws_access_key":
 				v := c.RemainingArgs()
 				if len(v) < 2 {
-					return "", nil, "", c.Errf("invalid access key '%v'", v)
+					return nil, c.Errf("invalid access key '%v'", v)
 				}
 				credential = credentials.NewStaticCredentials(v[0], v[1], "")
 			default:
-				return "", nil, "", c.Errf("unknown property '%s'", c.Val())
+				return nil, c.Errf("unknown property '%s'", c.Val())
 			}
 		}
 
@@ -111,25 +101,34 @@ func distributedParse(c *caddy.Controller) (string, []endpoint, string, error) {
 
 		endpoints, index, err := parseEndpointAndIndex(args[1], credential)
 		if err != nil {
-			return "", nil, "", err
+			return nil, err
 		}
 
 		tmpl := template.Must(template.New("nsid").Option("missingkey=error").Parse(args[2]))
 
 		if origin == "" || len(endpoints) == 0 || tmpl == nil {
-			return "", nil, "", c.Dispenser.ArgErr()
+			return nil, c.Dispenser.ArgErr()
 		}
 
 		var data bytes.Buffer
 		if err := tmpl.Execute(&data, map[string]string{"id": index}); err != nil {
-			return "", nil, "", err
+			return nil, err
 		}
 
-		nsid := plugin.Name(data.String()).Normalize()
+		identity := plugin.Name(data.String()).Normalize()
+		d := &Distributed{
+			Origin:    origin,
+			Identity:  nsid(identity),
+			Endpoints: &endpoints,
+			Entries: &entries{
+				byName: map[string][]net.IP{},
+				byAddr: map[string]string{},
+			},
+		}
 
-		return origin, endpoints, nsid, nil
+		return d, nil
 	}
-	return "", nil, "", c.Dispenser.ArgErr()
+	return nil, c.Dispenser.ArgErr()
 }
 
 func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]endpoint, string, error) {
