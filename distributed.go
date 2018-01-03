@@ -36,12 +36,14 @@ type entries struct {
 
 // Distributed plugin
 type Distributed struct {
-	Next      plugin.Handler
-	Origin    string
-	Identity  identity
-	Endpoints *[]endpoint
-	Entries   *entries
-	quit      chan struct{}
+	Next       plugin.Handler
+	Origin     string
+	Identity   identity
+	Endpoints  *[]endpoint
+	Entries    *entries
+	OnStartup  func(d *Distributed) error
+	OnShutdown func(d *Distributed) error
+	quit       chan struct{}
 }
 
 func (e *endpoint) update(d *Distributed) error {
@@ -143,53 +145,6 @@ func (d Distributed) lookup(ctx context.Context, qname string) []net.IP {
 			return entries
 		}
 	}
-	return nil
-}
-
-// OnShutdown is the shutdown handle
-func (d *Distributed) OnShutdown() error {
-	for i := range *d.Endpoints {
-		close((*d.Endpoints)[i].quit)
-	}
-	close(d.quit)
-	return nil
-}
-
-// OnStartup is the startup handle
-func (d *Distributed) OnStartup() error {
-	d.quit = make(chan struct{})
-	for i := range *d.Endpoints {
-		go func(e *endpoint) {
-			// Update record at the startup time
-			e.update(d)
-
-			tick := time.NewTicker(defaultInterval)
-
-			for {
-				select {
-				case <-tick.C:
-					if err := e.update(d); err != nil {
-						continue
-					}
-				case <-e.quit:
-					return
-				}
-			}
-		}(&(*d.Endpoints)[i])
-	}
-
-	go func() {
-		tick := time.NewTicker(defaultInterval)
-		for {
-			select {
-			case <-tick.C:
-				// do something
-			case <-d.quit:
-				return
-			}
-		}
-	}()
-
 	return nil
 }
 

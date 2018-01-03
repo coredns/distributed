@@ -5,12 +5,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
@@ -68,11 +70,56 @@ func setup(c *caddy.Controller) error {
 	})
 
 	c.OnStartup(func() error {
-		return d.OnStartup()
+		return d.OnStartup(d)
 	})
 	c.OnShutdown(func() error {
-		return d.OnShutdown()
+		return d.OnShutdown(d)
 	})
+
+	return nil
+}
+
+func onShutdown(d *Distributed) error {
+	for i := range *d.Endpoints {
+		close((*d.Endpoints)[i].quit)
+	}
+	close(d.quit)
+	return nil
+}
+
+func onStartup(d *Distributed) error {
+	d.quit = make(chan struct{})
+	for i := range *d.Endpoints {
+		go func(e *endpoint) {
+			// Update record at the startup time
+			e.update(d)
+
+			tick := time.NewTicker(defaultInterval)
+
+			for {
+				select {
+				case <-tick.C:
+					if err := e.update(d); err != nil {
+						continue
+					}
+				case <-e.quit:
+					return
+				}
+			}
+		}(&(*d.Endpoints)[i])
+	}
+
+	go func() {
+		tick := time.NewTicker(defaultInterval)
+		for {
+			select {
+			case <-tick.C:
+				// do something
+			case <-d.quit:
+				return
+			}
+		}
+	}()
 
 	return nil
 }
@@ -99,7 +146,7 @@ func distributedParse(c *caddy.Controller) (*Distributed, error) {
 
 		origin := plugin.Host(args[0]).Normalize()
 
-		endpoints, index, err := parseEndpointAndIndex(args[1], credential)
+		endpoints, index, autoscalingname, err := parseEndpointAndIndex(args[1], credential)
 		if err != nil {
 			return nil, err
 		}
@@ -124,6 +171,109 @@ func distributedParse(c *caddy.Controller) (*Distributed, error) {
 				byName: map[string][]net.IP{},
 				byAddr: map[string]string{},
 			},
+			OnShutdown: onShutdown,
+			OnStartup:  onStartup,
+		}
+		if autoscalingname != "" {
+			d.OnShutdown = func(d *Distributed) error {
+				for i := range *d.Endpoints {
+					close((*d.Endpoints)[i].quit)
+				}
+				close(d.quit)
+				return nil
+			}
+			d.OnStartup = func(d *Distributed) error {
+				az, err := ec2Metadata(ec2AvailabilityZone)
+				if err != nil {
+					return fmt.Errorf("invalide availability zone: %s", err)
+				}
+				if len(az) <= 1 {
+					return fmt.Errorf("invalide availability zone %q", az)
+				}
+				region := az[:len(az)-1]
+
+				service := autoscaling.New(session.Must(session.NewSession(&aws.Config{
+					Region:      aws.String(region),
+					Credentials: credential,
+				})))
+				ec2service := ec2.New(session.Must(session.NewSession(&aws.Config{
+					Region:      aws.String(region),
+					Credentials: credential,
+				})))
+
+				groups, err := service.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
+					AutoScalingGroupNames: []*string{
+						aws.String(autoscalingname),
+					},
+				})
+				if err != nil {
+					return err
+				}
+				d.quit = make(chan struct{})
+				for i := range *d.Endpoints {
+					go func(e *endpoint) {
+						// Update record at the startup time
+						e.update(d)
+
+						tick := time.NewTicker(defaultInterval)
+
+						for {
+							select {
+							case <-tick.C:
+								if err := e.update(d); err != nil {
+									continue
+								}
+							case <-e.quit:
+								return
+							}
+						}
+					}(&(*d.Endpoints)[i])
+				}
+				go func() {
+					tick := time.NewTicker(defaultInterval)
+					for {
+						select {
+						case <-tick.C:
+							result, err := service.DescribeScalingActivities(&autoscaling.DescribeScalingActivitiesInput{
+								AutoScalingGroupName: aws.String(autoscalingname),
+							})
+							if err != nil {
+								log.Printf("[INFO] unable to query autoscaling group %s", err)
+								continue
+							}
+							l := listInstances(result.Activities, int(aws.Int64Value(groups.AutoScalingGroups[0].DesiredCapacity)))
+							port := "53"
+							for v, i := range l {
+								result, err := ec2service.DescribeInstances(&ec2.DescribeInstancesInput{
+									Filters: []*ec2.Filter{
+										{
+											Name: aws.String("instance-id"),
+											Values: []*string{
+												aws.String(v),
+											},
+										},
+									},
+								})
+								if err != nil {
+									log.Printf("[INFO] unable to query instance %s", err)
+									continue
+								}
+								if len(result.Reservations) == 1 && len(result.Reservations[0].Instances) == 1 {
+									if (*d.Endpoints)[i].addr != aws.StringValue(result.Reservations[0].Instances[0].PrivateIpAddress) {
+										log.Printf("[INFO] update [%s] for %d", aws.StringValue(result.Reservations[0].Instances[0].PrivateIpAddress), i)
+										(*d.Endpoints)[i].addr = aws.StringValue(result.Reservations[0].Instances[0].PrivateIpAddress)
+										(*d.Endpoints)[i].port = port
+									}
+								}
+							}
+						case <-d.quit:
+							return
+						}
+					}
+				}()
+
+				return nil
+			}
 		}
 
 		return d, nil
@@ -131,18 +281,18 @@ func distributedParse(c *caddy.Controller) (*Distributed, error) {
 	return nil, c.Dispenser.ArgErr()
 }
 
-func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]endpoint, string, error) {
+func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]endpoint, string, string, error) {
 	var endpoints []endpoint
 
 	entries := map[string]struct{}{}
 	if strings.HasPrefix(arg, "aws:ec2:Subnet") {
 		privateIPAddress, err := ec2Metadata(ec2PrivateIPAddress)
 		if err != nil {
-			return nil, "", fmt.Errorf("invalid private ip: %s", err)
+			return nil, "", "", fmt.Errorf("invalid private ip: %s", err)
 		}
 		interfaces, err := net.Interfaces()
 		if err != nil {
-			return nil, "", fmt.Errorf("invalid interfaces: %s", err)
+			return nil, "", "", fmt.Errorf("invalid interfaces: %s", err)
 		}
 		for _, i := range interfaces {
 			addrs, err := i.Addrs()
@@ -173,26 +323,26 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 				}
 				id, err := ec2Metadata(ec2AmiLaunchIndex)
 				if err != nil {
-					return nil, "", fmt.Errorf("invalid launch index: %s", err)
+					return nil, "", "", fmt.Errorf("invalid launch index: %s", err)
 				}
-				return endpoints, id, nil
+				return endpoints, id, "", nil
 			}
 		}
 
-		return nil, "", fmt.Errorf("invalid subnet for %q", privateIPAddress)
+		return nil, "", "", fmt.Errorf("invalid subnet for %q", privateIPAddress)
 	}
 	if strings.HasPrefix(arg, "aws:autoscaling") {
 		instanceID, err := ec2Metadata(ec2InstanceID)
 		if err != nil {
-			return nil, "", fmt.Errorf("invalid instance id: %s", err)
+			return nil, "", "", fmt.Errorf("invalid instance id: %s", err)
 		}
 
 		az, err := ec2Metadata(ec2AvailabilityZone)
 		if err != nil {
-			return nil, "", fmt.Errorf("invalide availability zone: %s", err)
+			return nil, "", "", fmt.Errorf("invalide availability zone: %s", err)
 		}
 		if len(az) <= 1 {
-			return nil, "", fmt.Errorf("invalide availability zone %q", az)
+			return nil, "", "", fmt.Errorf("invalide availability zone %q", az)
 		}
 		region := az[:len(az)-1]
 
@@ -202,7 +352,7 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 		})))
 		groups, err := service.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{})
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 		name := ""
 		capacity := 0
@@ -219,18 +369,18 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 			}
 		}
 		if name == "" {
-			return nil, "", fmt.Errorf("invalid instance id for autoscaling group %q", instanceID)
+			return nil, "", "", fmt.Errorf("invalid instance id for autoscaling group %q", instanceID)
 		}
 		result, err := service.DescribeScalingActivities(&autoscaling.DescribeScalingActivitiesInput{
 			AutoScalingGroupName: aws.String(name),
 		})
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 		l := listInstances(result.Activities, capacity)
 		id, ok := l[instanceID]
 		if !ok {
-			return nil, "", fmt.Errorf("unable to allocate a slot for autoscaling for %q", instanceID)
+			return nil, "", "", fmt.Errorf("unable to allocate a slot for autoscaling for %q", instanceID)
 		}
 
 		for i := 0; i < capacity; i++ {
@@ -258,27 +408,28 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 				},
 			})
 			if err != nil {
-				return nil, "", err
+				return nil, "", "", err
 			}
 			if len(result.Reservations) == 1 && len(result.Reservations[0].Instances) == 1 {
+				log.Printf("[INFO] update [%s] for entry %d", aws.StringValue(result.Reservations[0].Instances[0].PrivateIpAddress), i)
 				endpoints[i].addr = aws.StringValue(result.Reservations[0].Instances[0].PrivateIpAddress)
 				endpoints[i].port = port
 			}
 		}
-		return endpoints, fmt.Sprintf("%d", id), nil
+		return endpoints, fmt.Sprintf("%d", id), name, nil
 	}
 	if strings.HasPrefix(arg, "aws:ec2:ReservationId") {
 		reservationID, err := ec2Metadata(ec2ReservationID)
 		if err != nil {
-			return nil, "", fmt.Errorf("invalid reservation id: %s", err)
+			return nil, "", "", fmt.Errorf("invalid reservation id: %s", err)
 		}
 
 		az, err := ec2Metadata(ec2AvailabilityZone)
 		if err != nil {
-			return nil, "", fmt.Errorf("invalide availability zone: %s", err)
+			return nil, "", "", fmt.Errorf("invalide availability zone: %s", err)
 		}
 		if len(az) <= 1 {
-			return nil, "", fmt.Errorf("invalide availability zone %q", az)
+			return nil, "", "", fmt.Errorf("invalide availability zone %q", az)
 		}
 		region := az[:len(az)-1]
 
@@ -298,7 +449,7 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 			},
 		})
 		if err != nil {
-			return nil, "", err
+			return nil, "", "", err
 		}
 
 		port := "53"
@@ -316,9 +467,9 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 
 		id, err := ec2Metadata(ec2AmiLaunchIndex)
 		if err != nil {
-			return nil, "", fmt.Errorf("invalid launch index: %s", err)
+			return nil, "", "", fmt.Errorf("invalid launch index: %s", err)
 		}
-		return endpoints, id, nil
+		return endpoints, id, "", nil
 	}
 	for _, s := range strings.Split(arg, ",") {
 		s = strings.TrimSpace(s)
@@ -330,12 +481,12 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 		port := "53"
 		colon := strings.LastIndex(s, ":")
 		if colon == len(s)-1 {
-			return nil, "", fmt.Errorf("expecting data after last colon: %q", s)
+			return nil, "", "", fmt.Errorf("expecting data after last colon: %q", s)
 		}
 		if colon != -1 {
 			if p, err := strconv.Atoi(s[colon+1:]); err == nil {
 				if p < 0 || p >= 65536 {
-					return nil, "", fmt.Errorf("invalid port number: %q", s[colon+1:])
+					return nil, "", "", fmt.Errorf("invalid port number: %q", s[colon+1:])
 				}
 				port = strconv.Itoa(p)
 				host = s[:colon]
@@ -344,12 +495,12 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 
 		slash := strings.LastIndex(host, "/")
 		if slash == len(host)-1 {
-			return nil, "", fmt.Errorf("expecting data after last slash: %q", host)
+			return nil, "", "", fmt.Errorf("expecting data after last slash: %q", host)
 		}
 		if slash != -1 {
 			ip, ipnet, err := net.ParseCIDR(host)
 			if err != nil {
-				return nil, "", fmt.Errorf("invalid cidr block %q: %s", host, err)
+				return nil, "", "", fmt.Errorf("invalid cidr block %q: %s", host, err)
 			}
 			l := listIPAddr(ip, ipnet)
 			// remove network address and broadcast address
@@ -368,7 +519,7 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 		}
 		ip := net.ParseIP(host)
 		if ip == nil {
-			return nil, "", fmt.Errorf("invalid ip address: %q", host)
+			return nil, "", "", fmt.Errorf("invalid ip address: %q", host)
 		}
 		if _, ok := entries[ip.String()]; !ok {
 			entries[ip.String()] = struct{}{}
@@ -381,9 +532,9 @@ func parseEndpointAndIndex(arg string, credential *credentials.Credentials) ([]e
 	}
 	id, err := ec2Metadata(ec2AmiLaunchIndex)
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid launch index: %s", err)
+		return nil, "", "", fmt.Errorf("invalid launch index: %s", err)
 	}
-	return endpoints, id, nil
+	return endpoints, id, "", nil
 }
 
 type byActivity []*autoscaling.Activity
@@ -395,13 +546,25 @@ func (s byActivity) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 func (s byActivity) Less(i, j int) bool {
-	return s[i].EndTime.Before(*s[j].EndTime) || s[i].StartTime.Before(*s[j].StartTime) || aws.StringValue(s[i].ActivityId) < aws.StringValue(s[j].ActivityId)
+	if s[i].EndTime.Before(*s[j].EndTime) {
+		return true
+	}
+	if s[i].EndTime.After(*s[j].EndTime) {
+		return false
+	}
+	if s[i].StartTime.Before(*s[j].StartTime) {
+		return true
+	}
+	if s[i].StartTime.After(*s[j].StartTime) {
+		return false
+	}
+	return aws.StringValue(s[i].ActivityId) < aws.StringValue(s[j].ActivityId)
 }
 
 func listInstances(activities []*autoscaling.Activity, capacity int) map[string]int {
 	entries := activities[:0]
 	for _, entry := range activities {
-		if strings.HasPrefix(aws.StringValue(entry.Description), "Launching a new EC2 instance: ") || strings.HasPrefix(aws.StringValue(entry.Description), "Terminating EC2 instance: ") || aws.StringValue(entry.StatusCode) == "Successful" {
+		if (strings.HasPrefix(aws.StringValue(entry.Description), "Launching a new EC2 instance: ") || strings.HasPrefix(aws.StringValue(entry.Description), "Terminating EC2 instance: ")) && aws.StringValue(entry.StatusCode) == "Successful" && entry.EndTime != nil {
 			entries = append(entries, entry)
 		}
 	}
@@ -418,9 +581,10 @@ func listInstances(activities []*autoscaling.Activity, capacity int) map[string]
 				}
 			}
 			if id < 0 {
-				panic(fmt.Errorf("no open slot %s", instanceID))
+				log.Printf("no open slot %s", instanceID)
+			} else {
+				slot[id] = instanceID
 			}
-			slot[id] = instanceID
 		} else if strings.HasPrefix(aws.StringValue(entry.Description), "Terminating EC2 instance: ") {
 			instanceID := aws.StringValue(entry.Description)[26:]
 			id := -1
@@ -432,9 +596,10 @@ func listInstances(activities []*autoscaling.Activity, capacity int) map[string]
 				}
 			}
 			if id < 0 {
-				panic(fmt.Errorf("unknown id %s", instanceID))
+				log.Printf("unknown id %s", instanceID)
+			} else {
+				delete(slot, id)
 			}
-			delete(slot, id)
 		}
 	}
 	instances := map[string]int{}
