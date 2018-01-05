@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation with CoreDNS and AutoScaling Group
+Mappings: 
+  AMI:
+    ap-southeast-2:
+      AMI: ami-33996b51
+Parameters:
+  CidrBlock:
+    Type: String
+    Default: 172.28.0.0/16
+  DebugCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+  CoreDNSVersion:
+    Type: String
+    Default: "0.1.2"
+  InstanceType:
+    Type: String
+    Default: t2.nano
+  DesiredCapacity:
+    Type: String
+    Default: 3
+  KeyName:
+    Type: String
+    Default: ""
+Conditions:
+  KeyName: !Equals [ !Ref KeyName, "" ]
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+  Policies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+        - 
+          Effect: "Allow"
+          Action: 
+          - "ec2:DescribeInstances"
+          - "autoscaling:DescribeAutoScalingGroups"
+          - "autoscaling:DescribeScalingActivities"
+          Resource: "*"
+      PolicyName: !Join [ "-", [ !Ref "AWS::StackName", "Policies" ] ]
+      Roles:
+      - !Ref Role
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref Role
+      InstanceProfileName: !Join [ "-", [ !Ref "AWS::StackName", "InstanceProfile" ] ]
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref CidrBlock
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicSubnet0:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Join [ ".", [ !Select [ 0, !Split [ ".", !GetAtt VPC.CidrBlock ] ], !Select [ 1, !Split [ ".", !GetAtt VPC.CidrBlock ] ], "0", "0/24" ] ]
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      Tags:
+      - Key: Name
+        Value: !Join [ "-", [ !Ref "AWS::StackName", "PublicSubnet0" ] ]
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Join [ ".", [ !Select [ 0, !Split [ ".", !GetAtt VPC.CidrBlock ] ], !Select [ 1, !Split [ ".", !GetAtt VPC.CidrBlock ] ], "1", "0/24" ] ]
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      Tags:
+      - Key: Name
+        Value: !Join [ "-", [ !Ref "AWS::StackName", "PublicSubnet1" ] ]
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Join [ ".", [ !Select [ 0, !Split [ ".", !GetAtt VPC.CidrBlock ] ], !Select [ 1, !Split [ ".", !GetAtt VPC.CidrBlock ] ], "2", "0/24" ] ]
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 2, !GetAZs "" ]
+      Tags:
+      - Key: Name
+        Value: !Join [ "-", [ !Ref "AWS::StackName", "PublicSubnet2" ] ]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Join [ "-", [ !Ref "AWS::StackName", "PublicRouteTable" ] ]
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet0RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet0
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+  DebugSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Debug (Port 22)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref DebugCidrIp
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties: 
+      KeyName: !If [ KeyName, !Ref "AWS::NoValue", !Ref KeyName ]
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+      - !GetAtt VPC.DefaultSecurityGroup
+      - !Ref DebugSecurityGroup
+      ImageId: !FindInMap [ AMI, !Ref "AWS::Region", AMI ]
+      InstanceType: !Ref InstanceType
+      UserData:
+        Fn::Base64: !Sub
+          - |+
+            #cloud-config
+
+            runcmd:
+              - set -x
+              - echo
+              - echo "Add 127.0.0.1 to the dns server list and restart DHCP client"
+              - echo
+              - echo "prepend domain-name-servers 127.0.0.1;" >> /etc/dhcp/dhclient.conf
+              - dhclient -r ; dhclient
+              - echo
+              - echo "Download distributed coredns and deploy"
+              - echo
+              - mkdir /etc/coredns
+              - curl -OL https://github.com/coredns/distributed/releases/download/v${CoreDNSVersion}/coredns_${CoreDNSVersion}_linux_amd64.tgz
+              - tar -xzf coredns_${CoreDNSVersion}_linux_amd64.tgz -C /etc/coredns
+              - chmod +x /etc/coredns/coredns
+              - echo ". {" > /etc/coredns/Corefile
+              - echo "    errors stdout" >> /etc/coredns/Corefile
+              - echo "    log stdout" >> /etc/coredns/Corefile
+              - echo "    distributed tf.local. aws:autoscaling worker{{.id}}.tf.local." >> /etc/coredns/Corefile
+              - echo "}" >> /etc/coredns/Corefile
+              - ulimit -n 65536
+              - nohup /etc/coredns/coredns -conf /etc/coredns/Corefile >/etc/coredns/stdout.log 2>/etc/coredns/stderr.log &
+
+            output: {all: '| tee -a /var/log/cloud-config.log'}
+          - { CoreDNSVersion: !Ref CoreDNSVersion }
+
+  WorkerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: !Ref DesiredCapacity
+      MaxSize: !Ref DesiredCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+      - !Ref PublicSubnet0
+      - !Ref PublicSubnet1
+      - !Ref PublicSubnet2
+      Tags:
+      -
+        Key: Name
+        Value: !Ref AWS::StackName
+        PropagateAtLaunch: true
+      -
+        Key: Worker
+        Value: true
+        PropagateAtLaunch: true
